@@ -3,7 +3,8 @@
 بوت تليجرام لخدمات نصية وصوتية بالذكاء الاصطناعي
 مبني على agentrouter.org (متوافق مع OpenAI API)
 
-يدعم الباقات الذكية، تفعيل الدفع بضغطة زر واحدة للأدمن، ونظام الإحالة ودعوة الأصدقاء.
+نظام تجربة مجانية محدودة، وبعدها تنبيه للاشتراك بالدفع اليدوي
+(انستاباي / فودافون كاش) وتفعيل يدوي من الأدمن.
 """
 
 import os
@@ -22,7 +23,7 @@ from telegram.ext import (
     filters,
 )
 
-# ============ الإعدادات ============
+# ============ الإعدادات (عدّل القيم دي في ملف .env) ============
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 AGENTROUTER_API_KEY = os.getenv("AGENTROUTER_API_KEY", "")
 AGENTROUTER_BASE_URL = os.getenv("AGENTROUTER_BASE_URL", "https://agentrouter.org/v1")
@@ -34,8 +35,8 @@ STT_MODEL = os.getenv("STT_MODEL", "whisper-1")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "4"))
 
-INSTAPAY_INFO = os.getenv("INSTAPAY_INFO", "01016336323")
-VODAFONE_CASH_NUMBER = os.getenv("VODAFONE_CASH_NUMBER", "01016336323")
+INSTAPAY_INFO = os.getenv("INSTAPAY_INFO", "اسم انستاباي / رقم المحفظة هنا")
+VODAFONE_CASH_NUMBER = os.getenv("VODAFONE_CASH_NUMBER", "01xxxxxxxxx")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
 TMP_DIR = os.path.join(os.path.dirname(__file__), "tmp")
@@ -104,6 +105,444 @@ TEXT_SERVICES = {
             "أنت استراتيجي محتوى سوشيال ميديا. اقترح خطة نشر مبسطة (أفكار "
             "بوستات موزعة على الأسبوع) بناءً على مجال العميل ومنصته."
         ),
+        "prompt_hint": "قولي مجال نشاطك والمنصة اللي هتنشر عليها.",
+    },
+}
+
+AUDIO_SERVICES = {
+    "tts": {"label": "🔊 تحويل نص إلى صوت"},
+    "stt": {"label": "📝 تحويل صوت إلى نص"},
+    "audio_translate": {"label": "🌍 ترجمة رسالة صوتية لنص"},
+}
+
+# ============ قاعدة البيانات ============
+
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db_connect()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            free_trials_used INTEGER DEFAULT 0,
+            points_balance INTEGER DEFAULT 0,
+            subscription_active INTEGER DEFAULT 0,
+            created_at TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_or_create_user(user_id: int, username: str):
+    conn = db_connect()
+    row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO users (user_id, username, created_at) VALUES (?, ?, ?)",
+            (user_id, username, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def can_use_service(user_id: int):
+    conn = db_connect()
+    row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return False, "user_not_found"
+    if row["free_trials_used"] < FREE_TRIAL_LIMIT:
+        return True, "trial"
+    if row["subscription_active"] == 1:
+        return True, "subscription"
+    if row["points_balance"] > 0:
+        return True, "points"
+    return False, "none"
+
+
+def consume_usage(user_id: int, reason: str):
+    conn = db_connect()
+    if reason == "trial":
+        conn.execute(
+            "UPDATE users SET free_trials_used = free_trials_used + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+    elif reason == "points":
+        conn.execute(
+            "UPDATE users SET points_balance = points_balance - 1 WHERE user_id = ?",
+            (user_id,),
+        )
+    conn.commit()
+    conn.close()
+
+
+def activate_subscription(user_id: int):
+    conn = db_connect()
+    conn.execute("UPDATE users SET subscription_active = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def add_points(user_id: int, amount: int):
+    conn = db_connect()
+    conn.execute(
+        "UPDATE users SET points_balance = points_balance + ? WHERE user_id = ?",
+        (amount, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ============ استدعاء الذكاء الاصطناعي ============
+
+def ask_ai_text(system_prompt: str, user_text: str) -> str:
+    try:
+        response = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            max_tokens=700,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"AI text error: {e}")
+        return "حصل خطأ أثناء التواصل مع الذكاء الاصطناعي، حاول تاني بعد شوية."
+
+
+def text_to_speech(text: str, out_path: str) -> bool:
+    try:
+        with client.audio.speech.with_streaming_response.create(
+            model=TTS_MODEL, voice=TTS_VOICE, input=text
+        ) as response:
+            response.stream_to_file(out_path)
+        return True
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return False
+
+
+def speech_to_text(file_path: str) -> str:
+    try:
+        with open(file_path, "rb") as f:
+            result = client.audio.transcriptions.create(model=STT_MODEL, file=f)
+        return result.text
+    except Exception as e:
+        logger.error(f"STT error: {e}")
+        return "حصل خطأ أثناء تحويل الصوت لنص، حاول تاني بعد شوية."
+
+
+def audio_translate(file_path: str) -> str:
+    try:
+        with open(file_path, "rb") as f:
+            result = client.audio.translations.create(model=STT_MODEL, file=f)
+        return result.text
+    except Exception as e:
+        logger.error(f"Audio translate error: {e}")
+        return "حصل خطأ أثناء ترجمة الصوت، حاول تاني بعد شوية."
+
+
+# ============ الحالة المؤقتة والقوائم ============
+user_state = {}
+
+
+def main_menu():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📝 الخدمات النصية", callback_data="menu_text")],
+            [InlineKeyboardButton("🎧 الخدمات الصوتية", callback_data="menu_audio")],
+            [InlineKeyboardButton("💳 رصيدي / اشتراكي", callback_data="check_balance")],
+        ]
+    )
+
+
+def text_services_menu():
+    rows = [
+        [InlineKeyboardButton(v["label"], callback_data=f"text_svc:{k}")]
+        for k, v in TEXT_SERVICES.items()
+    ]
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def audio_services_menu():
+    rows = [
+        [InlineKeyboardButton(v["label"], callback_data=f"audio_svc:{k}")]
+        for k, v in AUDIO_SERVICES.items()
+    ]
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ============ أوامر البوت ============
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    get_or_create_user(user.id, user.username or user.first_name)
+    user_state[user.id] = {}
+    await update.message.reply_text(
+        f"أهلاً {user.first_name} 👋\n\n"
+        f"عندك {FREE_TRIAL_LIMIT} محاولات مجانية تجرب بيها البوت.\n"
+        "اختار نوع الخدمة:",
+        reply_markup=main_menu(),
+    )
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"الـ Chat ID بتاعك: {update.effective_chat.id}")
+
+
+async def send_subscription_prompt(chat_send_func):
+    text = (
+        "خلصت المحاولات المجانية 🙏\n\n"
+        "للاستمرار، اشترك في الباقة الشهرية:\n\n"
+        f"💳 انستاباي: {INSTAPAY_INFO}\n"
+        f"📱 فودافون كاش: {VODAFONE_CASH_NUMBER}\n\n"
+        "بعد التحويل، ابعتلي في نفس الشات:\n"
+        "١) صورة سكرين شوت للتحويل\n"
+        "٢) رقم الموبايل اللي حولت منه (في وصف الصورة)\n\n"
+        "وهفعّل اشتراكك يدوياً خلال ساعات قليلة."
+    )
+    await chat_send_func(text)
+
+
+# ============ القوائم ============
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "back_main":
+        user_state[user_id] = {}
+        await query.edit_message_text("اختار نوع الخدمة:", reply_markup=main_menu())
+
+    elif data == "menu_text":
+        await query.edit_message_text("اختار الخدمة النصية:", reply_markup=text_services_menu())
+
+    elif data == "menu_audio":
+        await query.edit_message_text("اختار الخدمة الصوتية:", reply_markup=audio_services_menu())
+
+    elif data.startswith("text_svc:"):
+        key = data.split(":", 1)[1]
+        service = TEXT_SERVICES[key]
+        user_state[user_id] = {"mode": "text", "service": key}
+        await query.edit_message_text(f"{service['label']}\n\n{service['prompt_hint']}")
+
+    elif data.startswith("audio_svc:"):
+        key = data.split(":", 1)[1]
+        service = AUDIO_SERVICES[key]
+        user_state[user_id] = {"mode": "audio", "service": key}
+        if key == "tts":
+            hint = "ابعتلي النص اللي عايز تحوله لصوت."
+        else:
+            hint = "ابعتلي رسالة صوتية (Voice Message) أو ملف صوتي."
+        await query.edit_message_text(f"{service['label']}\n\n{hint}")
+
+    elif data == "check_balance":
+        conn = db_connect()
+        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        conn.close()
+        remaining_trial = max(0, FREE_TRIAL_LIMIT - row["free_trials_used"])
+        sub_status = "مفعّل ✅" if row["subscription_active"] == 1 else "غير مفعّل"
+        await query.edit_message_text(
+            f"محاولاتك المجانية المتبقية: {remaining_trial}\n"
+            f"رصيد النقاط: {row['points_balance']}\n"
+            f"الاشتراك الشهري: {sub_status}",
+            reply_markup=main_menu(),
+        )
+
+
+# ============ استقبال النصوص ============
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    get_or_create_user(user_id, update.effective_user.username or update.effective_user.first_name)
+
+    state = user_state.get(user_id, {})
+    mode = state.get("mode")
+    service_key = state.get("service")
+
+    if mode not in ("text", "audio"):
+        await update.message.reply_text("من فضلك اختار خدمة الأول من القائمة:", reply_markup=main_menu())
+        return
+
+    allowed, reason = can_use_service(user_id)
+    if not allowed:
+        await send_subscription_prompt(update.message.reply_text)
+        return
+
+    await update.message.chat.send_action("typing")
+
+    if mode == "text":
+        service = TEXT_SERVICES[service_key]
+        reply = ask_ai_text(service["system"], text)
+        consume_usage(user_id, reason)
+        await update.message.reply_text(reply)
+
+    elif mode == "audio" and service_key == "tts":
+        out_path = os.path.join(TMP_DIR, f"tts_{user_id}.mp3")
+        ok = text_to_speech(text, out_path)
+        if ok:
+            consume_usage(user_id, reason)
+            with open(out_path, "rb") as f:
+                await update.message.reply_voice(f)
+            os.remove(out_path)
+        else:
+            await update.message.reply_text("حصل خطأ أثناء توليد الصوت، حاول تاني.")
+
+    else:
+        await update.message.reply_text("ابعت رسالة صوتية عشان أقدر أساعدك في الخدمة دي 🎙️")
+        return
+
+    _warn_if_trial_ending(reason, user_id)
+    if reason == "trial":
+        await _send_trial_warning(update.message.reply_text, user_id)
+
+
+# ============ استقبال الرسائل الصوتية ============
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    get_or_create_user(user_id, update.effective_user.username or update.effective_user.first_name)
+
+    state = user_state.get(user_id, {})
+    mode = state.get("mode")
+    service_key = state.get("service")
+
+    if mode != "audio" or service_key not in ("stt", "audio_translate"):
+        await update.message.reply_text(
+            "من فضلك اختار خدمة 'تحويل صوت لنص' أو 'ترجمة صوتية' الأول من القائمة.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    allowed, reason = can_use_service(user_id)
+    if not allowed:
+        await send_subscription_prompt(update.message.reply_text)
+        return
+
+    await update.message.chat.send_action("typing")
+
+    voice = update.message.voice or update.message.audio
+    tg_file = await context.bot.get_file(voice.file_id)
+    in_path = os.path.join(TMP_DIR, f"in_{user_id}.ogg")
+    await tg_file.download_to_drive(in_path)
+
+    if service_key == "stt":
+        result_text = speech_to_text(in_path)
+    else:
+        result_text = audio_translate(in_path)
+
+    os.remove(in_path)
+    consume_usage(user_id, reason)
+    await update.message.reply_text(result_text)
+
+    if reason == "trial":
+        await _send_trial_warning(update.message.reply_text, user_id)
+
+
+def _warn_if_trial_ending(reason, user_id):
+    pass  # مكانها محجوز لو حبيت تضيف تنبيهات إضافية لاحقاً
+
+
+async def _send_trial_warning(reply_func, user_id):
+    row = get_or_create_user(user_id, "")
+    remaining = FREE_TRIAL_LIMIT - row["free_trials_used"]
+    if remaining <= 0:
+        await reply_func("🔔 دي كانت آخر محاولة مجانية، الرسالة الجاية هيبقى محتاج اشتراك.")
+
+
+# ============ استقبال سكرين شوت الدفع ============
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    caption = update.message.caption or "(من غير رقم متبعت)"
+
+    if ADMIN_CHAT_ID:
+        await context.bot.send_message(
+            ADMIN_CHAT_ID,
+            f"📩 إيصال دفع جديد\n"
+            f"من: {user.first_name} (@{user.username})\n"
+            f"الآيدي: {user.id}\n"
+            f"الرقم المرسل منه: {caption}\n\n"
+            f"للتفعيل استخدم: /activate {user.id}",
+        )
+        await context.bot.forward_message(
+            ADMIN_CHAT_ID, update.effective_chat.id, update.message.message_id
+        )
+        await update.message.reply_text(
+            "تم استلام الإيصال ✅ هيتم تفعيل اشتراكك يدوياً خلال ساعات قليلة، شكراً ليك."
+        )
+    else:
+        await update.message.reply_text("حصلت مشكلة في استلام الإيصال، من فضلك تواصل معانا مباشرة.")
+
+
+# ============ أوامر الأدمن ============
+
+async def activate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("استخدم: /activate <user_id>")
+        return
+    target_id = int(context.args[0])
+    activate_subscription(target_id)
+    await update.message.reply_text(f"تم تفعيل اشتراك المستخدم {target_id} ✅")
+    try:
+        await context.bot.send_message(
+            target_id, "🎉 تم تفعيل اشتراكك بنجاح! تقدر تستخدم البوت من غير حدود دلوقتي."
+        )
+    except Exception:
+        pass
+
+
+async def addpoints_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("استخدم: /addpoints <user_id> <عدد النقاط>")
+        return
+    target_id = int(context.args[0])
+    amount = int(context.args[1])
+    add_points(target_id, amount)
+    await update.message.reply_text(f"تم إضافة {amount} نقطة للمستخدم {target_id} ✅")
+
+
+# ============ تشغيل البوت ============
+
+def main():
+    init_db()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("activate", activate_cmd))
+    app.add_handler(CommandHandler("addpoints", addpoints_cmd))
+    app.add_handler(CallbackQueryHandler(menu_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    logger.info("البوت شغال...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
         "prompt_hint": "قولي مجال نشاطك والمنصة اللي هتنشر عليها.",
     },
 }
