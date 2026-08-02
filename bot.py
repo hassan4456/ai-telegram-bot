@@ -27,13 +27,13 @@ from telegram.ext import (
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 AGENTROUTER_API_KEY = os.getenv("AGENTROUTER_API_KEY", "")
 AGENTROUTER_BASE_URL = os.getenv("AGENTROUTER_BASE_URL", "https://agentrouter.org/v1")
-TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-4o-mini")
+TEXT_MODEL = os.getenv("TEXT_MODEL", "gpt-5.6-sol")
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 STT_MODEL = os.getenv("STT_MODEL", "whisper-1")
 
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "4"))
+FREE_TRIAL_LIMIT = int(os.getenv("FREE_TRIAL_LIMIT", "5"))
 
 INSTAPAY_INFO = os.getenv("INSTAPAY_INFO", "اسم انستاباي / رقم المحفظة هنا")
 VODAFONE_CASH_NUMBER = os.getenv("VODAFONE_CASH_NUMBER", "01xxxxxxxxx")
