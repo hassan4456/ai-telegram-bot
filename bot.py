@@ -281,6 +281,10 @@ PERSISTENT_KEYBOARD = ReplyKeyboardMarkup(
     [["📋 القائمة الرئيسية"]], resize_keyboard=True, is_persistent=True
 )
 
+BACK_TO_MENU_INLINE = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="back_main")]]
+)
+
 
 def main_menu():
     return InlineKeyboardMarkup(
@@ -557,7 +561,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service = TEXT_SERVICES[service_key]
         reply = ask_ai_text(service["system"], text)
         consume_usage(user_id, reason)
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, reply_markup=BACK_TO_MENU_INLINE)
 
     elif mode == "audio" and service_key == "tts":
         out_path = os.path.join(TMP_DIR, f"tts_{user_id}.mp3")
@@ -565,122 +569,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             consume_usage(user_id, reason)
             with open(out_path, "rb") as f:
-                await update.message.reply_voice(f)
+                await update.message.reply_voice(f, reply_markup=BACK_TO_MENU_INLINE)
             os.remove(out_path)
         else:
             await update.message.reply_text("حصل خطأ أثناء توليد الصوت، حاول تاني.")
-    else:
-        await update.message.reply_text("ابعت رسالة صوتية عشان أقدر أساعدك في الخدمة دي 🎙️")
-        return
-
-    if reason == "trial":
-        await _send_trial_warning(update.message.reply_text, user_id)
-
-
-async def _send_trial_warning(reply_func, user_id):
-    row, _ = get_or_create_user(user_id, "")
-    remaining = FREE_TRIAL_LIMIT - row["free_trials_used"]
-    if remaining <= 0:
-        await reply_func("🔔 دي كانت آخر محاولة مجانية، الرسالة الجاية هتحتاج نقاط أو اشتراك.")
-
-
-# ============ استقبال الرسائل الصوتية ============
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    get_or_create_user(user_id, update.effective_user.username or update.effective_user.first_name)
-
-    state = user_state.get(user_id, {})
-    mode = state.get("mode")
-    service_key = state.get("service")
-
-    if mode != "audio" or service_key not in ("stt", "audio_translate"):
-        await update.message.reply_text(
-            "من فضلك اختار خدمة 'تحويل صوت لنص' أو 'ترجمة صوتية' الأول من القائمة."
-        )
-        return
-
-    allowed, reason = can_use_service(user_id)
-    if not allowed:
-        await send_subscription_prompt(update.message.reply_text)
-        return
-
-    await update.message.chat.send_action("typing")
-
-    voice = update.message.voice or update.message.audio
-    tg_file = await context.bot.get_file(voice.file_id)
-    in_path = os.path.join(TMP_DIR, f"in_{user_id}.ogg")
-    await tg_file.download_to_drive(in_path)
-
-    if service_key == "stt":
-        result_text = speech_to_text(in_path)
-    else:
-        result_text = audio_translate(in_path)
-
-    os.remove(in_path)
-    consume_usage(user_id, reason)
-    await update.message.reply_text(result_text)
-
-    if reason == "trial":
-        await _send_trial_warning(update.message.reply_text, user_id)
-
-
-# ============ استقبال سكرين شوت الدفع ============
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    state = user_state.get(user.id, {})
-    caption = update.message.caption or "(من غير رقم متبعت)"
-    pkg_num = state.get("package")
-    pkg = PACKAGES.get(pkg_num) if pkg_num else None
-
-    if not ADMIN_CHAT_ID:
-        await update.message.reply_text("حصلت مشكلة في استلام الإيصال، من فضلك تواصل معانا مباشرة.")
-        return
-
-    pkg_line = (
-        f"الباقة: {pkg['price_egp']} جنيه - {pkg['points']} نقطة" if pkg else "الباقة: غير محددة"
-    )
-    buttons = [
-        [
-            InlineKeyboardButton(
-                "✅ موافقة وشحن", callback_data=f"approve:{user.id}:{pkg_num or 0}"
-            ),
-            InlineKeyboardButton("❌ رفض", callback_data=f"reject:{user.id}"),
-        ],
-        [InlineKeyboardButton("✉️ إرسال رسالة للمستخدم", callback_data=f"msg:{user.id}")],
-    ]
-
-    await context.bot.send_message(
-        ADMIN_CHAT_ID,
-        f"📩 إيصال دفع جديد\n"
-        f"من: {user.first_name} (@{user.username})\n"
-        f"الآيدي: {user.id}\n"
-        f"{pkg_line}\n"
-        f"الرقم المرسل منه: {caption}",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-    await context.bot.forward_message(ADMIN_CHAT_ID, update.effective_chat.id, update.message.message_id)
-    await update.message.reply_text("تم استلام الإيصال ✅ هيتفعّل رصيدك خلال ساعات قليلة، شكراً ليك.")
-    user_state[user.id] = {}
-
-
-# ============ تشغيل البوت ============
-
-def main():
-    init_db()
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CallbackQueryHandler(menu_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    logger.info("البوت شغال...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+   
